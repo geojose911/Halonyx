@@ -274,7 +274,7 @@ app.post("/add-contact", authenticate, (req, res) => {
 
 // WebSocket setup
 const wss = new WebSocket.Server({ server });
-const clients = new Map();
+const clients = new Map(); // hashed_usid -> WebSocket
 
 wss.on("connection", (ws, req) => {
   console.log("[WS] New connection");
@@ -282,19 +282,77 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data);
+
       if (msg.type === "register" && msg.usid) {
-        clients.set(msg.usid, ws);
-        ws.usid = msg.usid;
-        console.log(`[WS] Registered: ${msg.usid}`);
-      } else if (msg.type === "message" && msg.to && msg.payload) {
-        const target = clients.get(msg.to);
-        if (target && target.readyState === WebSocket.OPEN) {
-          target.send(JSON.stringify({ type: "message", from: ws.usid, payload: msg.payload }));
+        const userHashedUsid = msg.usid;
+        clients.set(userHashedUsid, ws);
+        ws.userHashedUsid = userHashedUsid;
+        console.log(`[WS] Registered: ${userHashedUsid.substring(0, 8)}...`);
+
+        // Deliver any queued offline messages
+        db.all(
+          "SELECT * FROM mailbox WHERE recipient_hashed_usid = ? ORDER BY timestamp ASC",
+          [userHashedUsid],
+          (err, rows) => {
+            if (err || !rows || rows.length === 0) return;
+            rows.forEach((row) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: "message",
+                    from: row.sender_hashed_usid,
+                    payload: row.content,
+                  })
+                );
+                db.run("DELETE FROM mailbox WHERE id = ?", [row.id]);
+              }
+            });
+            console.log(`[WS] Delivered ${rows.length} queued message(s) to ${userHashedUsid.substring(0, 8)}...`);
+          }
+        );
+
+      } else if (msg.type === "message" && msg.to && (msg.payload || msg.content)) {
+        const userHashedUsid = ws.userHashedUsid || null;
+        const to = msg.to;
+        const encrypted = msg.payload || null;
+
+        console.log(
+          `[WS] Message: ${userHashedUsid ? userHashedUsid.substring(0, 8) : "?"}... → ${to ? to.substring(0, 8) : "?"}...`
+        );
+
+        const recipientWs = clients.get(to);
+        if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          recipientWs.send(
+            JSON.stringify({ type: "message", from: userHashedUsid, payload: encrypted || msg.content })
+          );
+        } else {
+          // Recipient is offline — queue in mailbox (encrypted blobs only)
+          if (!encrypted) {
+            console.log("[WS] Only encrypted messages are queued for offline delivery");
+            return;
+          }
+          db.run(
+            "INSERT INTO mailbox (recipient_hashed_usid, sender_hashed_usid, content) VALUES (?, ?, ?)",
+            [to, userHashedUsid, encrypted],
+            (err) => {
+              if (err) {
+                console.error("[WS] Mailbox insert error:", err.message);
+              } else {
+                console.log(`[WS] Queued message for offline recipient ${to.substring(0, 8)}...`);
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ type: "queued" }));
+                }
+              }
+            }
+          );
         }
+
       } else if (msg.type === "broadcast") {
         clients.forEach((client) => {
           if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: "broadcast", from: ws.usid, payload: msg.payload }));
+            client.send(
+              JSON.stringify({ type: "broadcast", from: ws.userHashedUsid, payload: msg.payload })
+            );
           }
         });
       }
@@ -304,9 +362,9 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    if (ws.usid) {
-      clients.delete(ws.usid);
-      console.log(`[WS] Disconnected: ${ws.usid}`);
+    if (ws.userHashedUsid) {
+      clients.delete(ws.userHashedUsid);
+      console.log(`[WS] Disconnected: ${ws.userHashedUsid.substring(0, 8)}...`);
     }
   });
 });

@@ -1,0 +1,5 @@
+# Normalize all text files to LF on checkout (Linux CI will get LF, fixing regex tests)
+* text=auto eol=lf
+
+# Keep Windows batch scripts with CRLF so CMD can run them
+*.bat text eol=crlf

@@ -19,3 +19,11 @@ CREATE TABLE IF NOT EXISTS messages (
     ciphertext TEXT NOT NULL,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS mailbox (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_hashed_usid TEXT NOT NULL,
+    sender_hashed_usid    TEXT NOT NULL,
+    content               TEXT NOT NULL,
+    timestamp             DATETIME DEFAULT CURRENT_TIMESTAMP
+);
