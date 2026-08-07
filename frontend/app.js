@@ -86,8 +86,8 @@ const SEED_MESSAGES = {
 /* ─────────────────────── Init ─────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
   loadIdentity();
-  contacts = JSON.parse(JSON.stringify(SEED_CONTACTS));
-  messageStore = JSON.parse(JSON.stringify(SEED_MESSAGES));
+  contacts = [];
+  messageStore = {};
   renderContactList(contacts);
   setupBroadcastCounter();
 });
