@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  caddy:
+    image: caddy:alpine
+    container_name: halonyx-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - halonyx
+
+  halonyx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: halonyx-app
+    restart: unless-stopped
+    expose:
+      - "3000"
+    ports:
+      - "127.0.0.1:${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    volumes:
+      - halonyx-db-data:/app/backend/db
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  halonyx-db-data:
+    driver: local
+  caddy_data:
+  caddy_config:

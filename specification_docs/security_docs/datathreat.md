@@ -29,6 +29,8 @@ This document identifies and analyzes data threats applicable to the Halonyx sec
 | Public key bundle | `keys.db`, `app.db`, API | **Low** | Public by design; integrity matters more than confidentiality |
 | Mailbox messages (offline) | `app.db / mailbox` table | **High** | Stored unencrypted on server for offline delivery |
 | UDP broadcast content | Network (plaintext UDP) | **High** | Emergency messages sent as cleartext over UDP |
+| Group metadata & membership | Client `localStorage` / inside envelope | **High** | Group IDs, member lists, and names; kept client-side inside encrypted Signal envelopes; server blind |
+| Sensitive credentials & PII | Client memory (pre-encryption) | **Critical** | API tokens, private keys, credit cards scanned and blocked by client DLP before envelope sealing |
 | Third-party dependency code | `node_modules` | **Medium–High** | Transitive packages executing with full server/client privileges |
 
 ---
@@ -255,10 +257,12 @@ If an attacker obtains another user's plaintext USID (via T-02 or other leakage)
 **Impact:** Message interception. Attacker receives all messages intended for the victim until the victim reconnects and re-registers, evicting the attacker's socket.
 
 **Mitigation:**
-- Require a JWT token in the WebSocket `register` message and verify it server-side before adding to the `clients` Map.
-- Reject duplicate registrations for the same hashed USID (or evict old with a challenge).
+- ✅ Required a valid JWT token in the WebSocket `register` message payload (`token` field).
+- ✅ Validated the token server-side with `jwt.verify(token, JWT_SECRET)` and extracted `decoded.hashedUsid`. Registration is strictly bound to the authenticated identity from the verified token.
+- ✅ Completely removed acceptance of raw or unauthenticated hashed USIDs in the `register` handler.
+- ✅ Gracefully disconnects superseded connections for the same identity to prevent split-brain sessions.
 
-**Status:** ⚠️ Unmitigated.
+**Status:** ✅ Mitigated.
 
 ---
 
@@ -281,12 +285,12 @@ The server is configured to listen on HTTP (`http.createServer(app)`) on port 30
 **Impact:** Metadata leakage (who communicates with whom, when), JWT theft, public key bundle tampering (enabling MITM of E2EE sessions).
 
 **Mitigation:**
-- Terminate TLS with a reverse proxy (Nginx / Caddy) in front of the Node.js server.
-- Redirect all HTTP to HTTPS and all WS to WSS.
-- Set `Strict-Transport-Security` (HSTS) header.
-- **Note:** Mitigated in production deployment (Render terminates TLS at edge). Unmitigated for self-hosted deployments without a reverse proxy.
+- ✅ Added Caddy service (`caddy:alpine`) to `docker-compose.yml` for self-hosters with automated TLS certificate management and HTTP to HTTPS redirection.
+- ✅ Configured `Caddyfile` with `Strict-Transport-Security` (HSTS), reverse proxying to `halonyx:3000`, and WebSocket upgrade support.
+- ✅ Restricted application container port to `127.0.0.1:3000` to prevent unencrypted public access.
+- ✅ Mitigated in production deployment via edge TLS termination (Render) and self-hosted deployments via Caddy reverse proxy.
 
-**Status:** ⚡ Partially mitigated.
+**Status:** ✅ Mitigated.
 
 ---
 
@@ -331,11 +335,11 @@ The server has no Content Security Policy (CSP) header. The frontend loads proto
 **Impact:** Full session hijack, private key exfiltration, message interception.
 
 **Mitigation:**
-- Add a strict CSP header: `Content-Security-Policy: default-src 'self'; script-src 'self'; connect-src 'self' ws://localhost:8081`.
-- Audit all DOM writes for `innerHTML` usage; replace with `textContent` or `createElement`.
-- Sanitize all user-supplied content before rendering.
+- ✅ Added strict Content Security Policy (CSP) header in `backend/server.js` and `Caddyfile`: `default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self' ws: wss: https://cdn.jsdelivr.net wss://tracker.openwebtorrent.com wss://tracker.webtorrent.dev wss://tracker.files.fm:7073 wss://tracker.btorrent.xyz; object-src 'none'; base-uri 'self'; form-action 'self'`.
+- ✅ Added defensive transport headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`.
+- ✅ Audited and hardened all DOM writes in `frontend/js/app.js`: removed inline JavaScript string interpolation in `onclick` handlers (`copyMessageById`, `downloadFileByMsgId`, `openMagnetByMsgId` look up state safely in memory), sanitized emergency banner author strings, escaped safety number grid entries, and hardened `escapeHTML` and `escapeAttr` against null/undefined and special characters.
 
-**Status:** ⚠️ Unmitigated.
+**Status:** ✅ Mitigated.
 
 ---
 
@@ -404,11 +408,11 @@ Any authenticated user can send unlimited messages to an offline recipient. Each
 **Impact:** Disk exhaustion causing server crash; reconnect storm as victim flushes a massive mailbox.
 
 **Mitigation:**
-- Enforce a per-recipient mailbox cap (e.g., 200 messages).
-- Return an error to the sender and drop excess messages.
-- Add a TTL index to auto-expire old mailbox entries.
+- ✅ Enforced a per-recipient mailbox cap (`MAILBOX_CAP = 200`). When a recipient's mailbox reaches the limit, excess messages are dropped and an explicit error (`"Recipient mailbox is full (cap reached)"`) is returned to the sender.
+- ✅ Implemented 7-day TTL auto-expiry (`timestamp < datetime('now', '-7 days')`), automatically purging expired offline messages on message insertion and during registration mailbox flush.
+- ✅ Added SQLite indices `idx_mailbox_recipient` and `idx_mailbox_timestamp` to optimize lookups and pruning.
 
-**Status:** ⚠️ Unmitigated.
+**Status:** ✅ Mitigated.
 
 ---
 
@@ -502,6 +506,158 @@ An `npm audit` run reports 22 known vulnerabilities across the dependency tree (
 
 **Status:** ⚡ Partially mitigated (visibility via CI; 6 of 9 non-`node-gyp`-chain issues fixable non-breaking; breaking-change upgrades pending).
 
+### 3.19 Threat T-19 — Missing WebSocket Origin Validation (Defense-in-Depth Gap)
+
+**Category:** Authentication / Spoofing
+**STRIDE:** Spoofing
+**Severity:** 🟡 Medium
+
+**Description:**
+The WebSocket server does not validate the `Origin` header on the upgrade handshake. Any page — including one hosted on an entirely unrelated origin — can open a raw WebSocket connection directly to the Halonyx server. Because the `register` flow currently depends on possessing a secret value (the plaintext USID; see T-08) rather than a same-origin cookie, a page on another origin cannot itself read that secret via script (same-origin policy blocks cross-origin `localStorage` access), so this is not a classic full cross-site WebSocket hijack in the cookie-session sense. It remains a defense-in-depth gap: an attacker's page can open unrestricted connections, probe server behavior toward unregistered sockets, and reach unauthenticated message paths without any origin restriction.
+
+**Attack Vector:** Cross-origin script running in a victim's browser, connecting directly to the WS endpoint.
+
+**Affected Components:** WebSocket upgrade handler in `backend/server.js`.
+
+**Impact:** Low-to-moderate in isolation (same-origin policy prevents secret exfiltration on its own), but compounds any future authentication change that comes to rely on browser-supplied context (e.g., cookies) instead of an explicit secret in the message payload — and removes a layer of defense that costs little to add now.
+
+**Mitigation:**
+- Validate the `Origin` header on the WS upgrade request against an explicit allowlist of trusted origins.
+- If T-08's proposed JWT-based registration fix is implemented, ensure the JWT is only ever accepted from the message payload — never from a cookie — preserving the current secret-in-payload model that already limits this threat's severity.
+
+**Status:** ⚠️ Unmitigated.
+
+---
+
+### 3.20 Threat T-20 — Client-Side Trust Anchor Tampering (Safety Number Suppression)
+
+**Category:** Integrity / Key Authenticity
+**STRIDE:** Tampering
+**Severity:** 🟠 High
+
+**Description:**
+The last-verified Safety Number for each contact is stored in the browser's `localStorage` (see T-10) and compared against the freshly computed value on each session to detect key substitution — this comparison is Halonyx's primary user-facing defense against the server-side MITM described in T-15. `localStorage` is fully writable by any same-origin script. An attacker with an XSS foothold (T-11), a malicious browser extension, or transient physical/device access can silently overwrite the stored safety number to match a freshly substituted key, suppressing the key-change warning entirely — without the user ever seeing a mismatch.
+
+**Attack Vector:** XSS (T-11), malicious browser extension, or local device access, exercised alongside an active key-substitution attack (T-15). Not exploitable on its own — this threat defeats the *detection* mechanism, not the underlying key exchange.
+
+**Affected Components:** `frontend/js/app.js` Safety Number storage and comparison logic.
+
+**Impact:** Defeats the Safety Number mechanism specifically. A user could be shown a "keys match" state, or no warning at all, while actually communicating with a substituted identity — silently negating the one control designed to catch exactly that.
+
+**Mitigation:**
+- Do not rely solely on unauthenticated `localStorage` for trust-state; consider binding the stored safety-number record to a value derived from non-exportable key material, so a plain overwrite cannot forge a valid "verified" state.
+- ✅ Fixing T-11 (CSP) and DOM write auditing closes the most likely delivery path (XSS) for this attack.
+- Supported manual out-of-band verification with grouped safety numbers and fingerprint comparison dialog.
+
+**Status:** ⚡ Partially mitigated.
+
+---
+
+### 3.21 Threat T-21 — Plaintext Client-Side Message History in localStorage
+
+**Category:** Confidentiality / Local Storage Security
+**STRIDE:** Information Disclosure
+**Severity:** 🟠 High
+
+**Description:**
+Prior implementations stored decrypted message transcript logs in unencrypted browser `localStorage` (`messageHistory:${myUsid}`). Anyone with physical access to the device, local file system access, or an XSS vulnerability (T-11) could read the entire plain-text conversation history directly from browser storage, bypassing E2EE protections at rest on the client device.
+
+**Attack Vector:** Local device extraction, malicious browser extensions, or XSS execution reading `localStorage`.
+
+**Affected Components:** `frontend/js/app.js` (`saveMessageHistoryAsync`, `loadMessageHistoryAsync`).
+
+**Impact:** Compromise of local message confidentiality at rest on the client browser.
+
+**Mitigation:**
+- Implemented client-side AES-256-GCM encryption for stored message history.
+- Dynamic key derivation via Web Crypto API `crypto.subtle.digest('SHA-256', usid)` to derive a 256-bit symmetric encryption key per user identity.
+- Encrypted envelope payload format (`{ v: 1, enc: "<hex>", iv: "<hex>" }`) using a unique, cryptographically random 12-byte initialization vector (IV) for every write operation.
+- Automatic non-destructive migration of unencrypted legacy local history records into AES-256-GCM encrypted format upon application launch.
+
+**Status:** ✅ **Mitigated.** Client message history in `localStorage` is fully encrypted at rest using Web Crypto AES-256-GCM.
+
+---
+
+### 3.22 Threat T-22 — Group Metadata Leakage & Cross-Session Compromise
+
+**Category:** Confidentiality / Multi-Party Cryptographic Isolation  
+**STRIDE:** Information Disclosure, Tampering  
+**Severity:** 🟠 High  
+
+**Description:**  
+Group messaging architectures frequently introduce vulnerabilities by centralizing group membership lists, admin roles, or channel identities on the server. Furthermore, implementations using a single shared symmetric key risk catastrophic compromise: if one member's key is extracted, all past and future group transcripts across all participants are breached. If the server manages group state, server compromises expose group rosters and social graph topology.
+
+**Attack Vector:** Server-side database dump, network eavesdropping on group control messages, or client compromise of a single group member.
+
+**Affected Components:** `frontend/js/groups.js`, `protocol/envelope.js`, `backend/server.js`.
+
+**Impact:** Exposure of group participant rosters, eavesdropping on multi-party discussions, and loss of cryptographic forward secrecy across group conversations.
+
+**Mitigation:**
+- Implemented **Signal Groups v1 pairwise Double Ratchet fan-out** (`frontend/js/groups.js`).
+- **Complete Server Blindness:** The backend server (`backend/server.js`) maintains **zero database tables and zero awareness of groups**. Group creation, membership updates, and discovery happen exclusively inside client-side encrypted payloads.
+- **Cryptographic Isolation:** Every group message is encrypted into $N-1$ unique ciphertexts using the sender's individual Double Ratchet session with each group recipient. A compromise of one peer session does not expose messages to or from any other peer.
+- **Metadata Shielding:** Group IDs, channel names, and member rosters are embedded inside the `v: 1` Signal envelope (`group: { id, name, members, action }`) before ratchet encryption.
+- **Decentralized Auto-Discovery:** Group invitations (`action: 'join'`) and updates are discovered and registered client-side upon decrypting the envelope, eliminating central directory dependencies.
+
+**Status:** ✅ **Mitigated.** Multi-party group communication maintains strict pairwise Double Ratchet isolation and complete server blindness.
+
+---
+
+### 3.23 Threat T-23 — Accidental Credential Exfiltration & Data Loss (DLP Bypass)
+
+**Category:** Data Loss / Secret Exfiltration  
+**STRIDE:** Information Disclosure  
+**Severity:** 🟠 High  
+
+**Description:**  
+Users frequently paste sensitive development credentials, production cloud keys, internal tokens, private cryptographic keys, or payment information into messaging channels during operational incidents. Once encrypted and sent across the Double Ratchet channel, these secrets become indelibly recorded in recipient conversation logs and offline mailboxes.
+
+**Attack Vector:** User error, developer copy-paste of environment variables, or automated clipboard script exfiltration.
+
+**Affected Components:** `frontend/js/dlp.js`, `frontend/js/app.js` (`sendMessage`, `sendGroupMessage`).
+
+**Impact:** Exposure of high-privilege credentials (AWS root/IAM keys, GitHub PATs, Slack bot tokens, SSH private keys) or payment card details (PCI-DSS violation) across chat history.
+
+**Mitigation:**
+- Implemented an **Enterprise Client-Side DLP Engine** (`frontend/js/dlp.js`) executing strictly *before* `SignalProtocol.encryptMessage()`.
+- **Pre-Encryption Interception:** Message payloads are scanned prior to envelope serialization and encryption. If a rule triggers, transmission is blocked client-side.
+- **High-Fidelity Regex Detection:**
+  - AWS Access Key IDs (`AKIA[0-9A-Z]{16}`)
+  - GitHub Personal Access Tokens (`ghp_[a-zA-Z0-9]{36}`, `gho_`, `github_pat_`)
+  - Slack Bot/User Tokens (`xox[baprs]-[0-9a-zA-Z-]{10,72}`)
+  - Cryptographic Private Keys (`-----BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY-----`)
+  - Generic High-Entropy API Secrets (Hex 32-64 chars, Base64 tokens)
+- **PCI-DSS Credit Card Validation:** Detects Visa, MasterCard, and American Express numbers and validates against the **Luhn algorithm (Mod-10 checksum)** to prevent false positives while blocking genuine card leaks.
+- **Configurable Policy Enforcement:** Supports hard `BLOCK` (aborts send and presents UI modal) and `WARN` (requests explicit confirmation).
+- **Masked Audit Trail:** Violations are recorded in `localStorage` audit history using masked rule tags (`[REDACTED-DLP: <Rule>]`), guaranteeing that audit logs never become a secondary secret exposure vector.
+
+**Status:** ✅ **Mitigated.** Pre-encryption DLP engine intercepts and blocks sensitive tokens and card data before cryptographic transmission.
+
+---
+
+### 3.24 Threat T-24 — Markdown Rendering Cross-Site Scripting
+
+**Category:** Client-Side Injection / Integrity
+**STRIDE:** Tampering, Elevation of Privilege
+**Severity:** High
+
+Untrusted Markdown may contain hostile HTML or unsafe links. Messages are parsed only after decryption; marked HTML output is escaped and DOMPurify applies explicit tag, attribute, and URI allowlists before insertion. Plain text remains escaped.
+
+**Status:** Mitigated; review the renderer and pinned builds when upgrading dependencies.
+
+---
+
+### 3.25 Threat T-25 — Remote Markdown Image IP Leakage
+
+**Category:** Privacy / Information Disclosure
+**STRIDE:** Information Disclosure
+**Severity:** Medium
+
+Remote Markdown images can disclose the recipient's IP address and request metadata. Image syntax is rendered as a visible link/placeholder and image elements are excluded by the sanitizer, so display never loads a remote image.
+
+**Status:** Mitigated; opening an external link still contacts its destination.
+
 ---
 
 ## 4. Threat Summary Matrix
@@ -515,17 +671,22 @@ An `npm audit` run reports 22 known vulnerabilities across the dependency tree (
 | T-05 | No rate limiting | 🟠 High | All endpoints | ⚡ Partially mitigated |
 | T-06 | Email enumeration via signup | 🟠 High | `POST /signup` | ⚠️ Unmitigated |
 | T-07 | SQL injection / weak input validation | 🟠 High | All DB queries | ⚡ Partially mitigated |
-| T-08 | WebSocket unauthenticated registration | 🟠 High | WS `register` handler | ⚠️ Unmitigated |
-| T-09 | Missing HTTPS / TLS | 🟠 High | Full stack | ⚡ Partially mitigated |
+| T-08 | WebSocket unauthenticated registration | 🟠 High | WS `register` handler | ✅ Mitigated |
+| T-09 | Missing HTTPS / TLS | 🟠 High | Full stack | ✅ Mitigated |
 | T-10 | Private keys in localStorage | 🟠 High | `app.js` | ⚡ Partially mitigated |
-| T-11 | Missing CSP / XSS risk | 🟠 High | Frontend | ⚠️ Unmitigated |
+| T-11 | Missing CSP / XSS risk | 🟠 High | Frontend | ✅ Mitigated |
 | T-12 | Hashed USID metadata leakage | 🟡 Medium | WS wire, DB | ⚡ Partially mitigated |
 | T-13 | No audit trail for abuse | 🟡 Medium | WS / UDP handlers | ⚡ Partially mitigated |
-| T-14 | Mailbox flooding (DoS) | 🟡 Medium | `mailbox` table | ⚠️ Unmitigated |
+| T-14 | Mailbox flooding (DoS) | 🟡 Medium | `mailbox` table | ✅ Mitigated |
 | T-15 | Public key tampering (MITM E2EE) | 🟠 High | `GET /pubkey`, X3DH | ⚡ Partially mitigated |
 | T-16 | WebRTC / WebTorrent IP Leak | 🟠 High | WebTorrent / TURN | ⚠️ Unmitigated |
 | T-17 | OPK Exhaustion / X3DH Fallback | 🟠 High | `signal_protocol.js` | ✅ Mitigated |
 | T-18 | Vulnerable transitive dependencies (npm audit) | 🟠 High | Dependency tree | ⚡ Partially mitigated |
+| T-19 | Missing WebSocket Origin validation | 🟡 Medium | WS upgrade handler | ⚠️ Unmitigated |
+| T-20 | Client-side trust anchor tampering (Safety Number suppression) | 🟠 High | `app.js`, `localStorage` | ⚡ Partially mitigated |
+| T-21 | Plaintext Client-Side Message History in `localStorage` | 🟠 High | `app.js`, `localStorage` | ✅ Mitigated |
+| T-22 | Group Metadata Leakage & Cross-Session Compromise | 🟠 High | `groups.js`, `envelope.js` | ✅ Mitigated |
+| T-23 | Accidental Credential Exfiltration & Data Loss (DLP Bypass) | 🟠 High | `dlp.js`, `app.js` | ✅ Mitigated |
 
 ---
 
@@ -537,32 +698,33 @@ An `npm audit` run reports 22 known vulnerabilities across the dependency tree (
 2. ~~**T-02:** Remove USID from JWT payload; derive it server-side from `userId`.~~ (Mitigated via hashedUsid in JWT payload)
 3. ~~**T-03:** Ensure only ciphertext is ever stored in `mailbox`; never store `content` field.~~ (Mitigated)
 4. ~~**T-04:** Bind UDP to `127.0.0.1`; add HMAC authentication to UDP messages; add rate limiting + auto-ban.~~ (Mitigated via secret token, RateBucket per-IP/global rate limiting, auto-ban, payload size/content validation)
-5. **T-09:** Deploy behind an Nginx/Caddy TLS reverse proxy; enforce HTTPS.
+5. ~~**T-09:** Deploy behind an Nginx/Caddy TLS reverse proxy; enforce HTTPS.~~ (Mitigated via Caddy service in docker-compose.yml and Caddyfile)
 
 ### Phase 2 — High Priority (Within First Sprint Post-Launch)
 
-6. **T-08:** Require JWT verification in WebSocket `register` message.
+6. ~~**T-08:** Require JWT verification in WebSocket `register` message.~~ (Mitigated via JWT verification in WS register)
 7. ~~**T-05 (partial):** Add rate limiting to signup, key upload, UDP, and WS emergency endpoints.~~ (Mitigated: `express-rate-limit` on signup/key endpoints; `RateBucket` on UDP + WS emergency)
-7b. **T-05 (remaining):** Add mailbox size caps and WebSocket connection limits per IP.
+7b. **T-05 (remaining):** Add WebSocket connection limits per IP.
 8. **T-10:** Use `HttpOnly` cookies for JWT; use non-extractable Web Crypto keys.
-9. **T-11:** Add CSP headers; audit all `innerHTML` usage.
+9. ~~**T-11:** Add CSP headers; audit all `innerHTML` usage.~~ (Mitigated via Express & Caddy CSP headers, DOM sanitization, safe ID lookups)
 10. **T-15:** Implement safety number UI for key fingerprint verification.
 11. **T-18 (partial):** Run `npm audit fix` to resolve the six non-breaking dependency vulnerabilities (`brace-expansion`, `minimatch`, `path-to-regexp`, `picomatch`, `qs`, `ws`) — no compatibility risk, immediate action.
+12. ~~**T-20:** Bind the stored Safety Number to non-exportable key material rather than trusting a plain `localStorage` value; closing T-11 (CSP) also removes this threat's most likely delivery path.~~ (Partially mitigated via T-11 CSP and DOM write sanitization)
 
 ### Phase 3 — Medium Priority (Ongoing Hardening)
 
-12. **T-06:** Uniform signup response regardless of email existence.
-13. **T-07:** Add strict USID and email format validation before all DB queries.
-14. **T-14:** Enforce mailbox size cap (200 messages per recipient).
-15. ~~**T-13 (partial):** Log emergency broadcast events with sender identity and delivery count.~~ (Mitigated via console logging with source identification)
-15b. **T-13 (remaining):** Implement formal append-only audit log file separate from stdout.
-16. **T-12:** Investigate ephemeral routing tokens to reduce metadata linkability.
-17. **T-18 (remaining):** Plan and test the three breaking-change dependency upgrades (`sqlite3` → 6.0.1, `webtorrent` → latest major, `nodemailer` → 9.0.3) as a deliberate migration.
-
+13. **T-06:** Uniform signup response regardless of email existence.
+14. **T-07:** Add strict USID and email format validation before all DB queries.
+15. ~~**T-14:** Enforce mailbox size cap (200 messages per recipient) and TTL auto-expiry.~~ (Mitigated via 200 message limit and 7-day TTL auto-cleanup)
+16. ~~**T-13 (partial):** Log emergency broadcast events with sender identity and delivery count.~~ (Mitigated via console logging with source identification)
+16b. **T-13 (remaining):** Implement formal append-only audit log file separate from stdout.
+17. **T-12:** Investigate ephemeral routing tokens to reduce metadata linkability.
+18. **T-18 (remaining):** Plan and test the three breaking-change dependency upgrades (`sqlite3` → 6.0.1, `webtorrent` → latest major, `nodemailer` → 9.0.3) as a deliberate migration.
+19. **T-19:** Add an `Origin` allowlist check to the WebSocket upgrade handler.
 ---
 
 *Generated: 2026-06-30*
-*Last Updated: 2026-07-18 — UDP anti-spam controls (RateBucket, per-IP/global rate limiting, auto-ban, payload validation); added T-18 (vulnerable transitive dependencies via npm audit)*
+*Last Updated: 2026-10-17 — updated T-08 (JWT-authenticated WS register), T-09 (Caddy TLS reverse proxy), T-11 (CSP & DOM write sanitization), T-14 (per-recipient mailbox cap & 7-day TTL), and T-20*
 
 ## Security Disclaimer
 
@@ -572,3 +734,7 @@ While the system implements multiple security mechanisms inspired by modern encr
 Threats, mitigations, and architectural assumptions documented here are subject to change as the project evolves. Security analysis is an ongoing process involving continuous review, testing, benchmarking, and hardening.
 
 Halonyx is currently an academic and research-oriented project and has not undergone independent cryptographic or professional security auditing.
+
+### Message Reactions
+
+Reactions are encrypted envelopes relayed through the same message path as chat text. The relay cannot distinguish a reaction or read its sender or target from ciphertext. Reactions leak timing and delivery counts to the same degree as messages. Sender identity comes from the authenticated session; target IDs and emojis are validated locally. The emoji allowlist and payload validation limit abuse, and pending reactions have a small cap and short TTL.

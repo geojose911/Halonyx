@@ -54,7 +54,12 @@ class SignalProtocol {
       const bundle = await this.x3dh.generateKeyBundle();
       this.identity = bundle;
       await this.idb.saveIdentity(bundle);
+    }
+    // Always sync public bundle to server so keys.db is kept populated
+    try {
       await this._uploadPublicBundle();
+    } catch (uploadErr) {
+      console.warn('[Signal] Key bundle upload error during init:', uploadErr);
     }
 
     // Restore any persisted sessions
@@ -145,8 +150,10 @@ class SignalProtocol {
   async _fetchPeerBundle(peerUsid) {
     const res = await fetch(`/keys/${encodeURIComponent(peerUsid)}`);
     if (!res.ok) throw new Error(`[Signal] No key bundle for peer ${peerUsid.substring(0, 12)}`);
-    const { bundle } = await res.json();
-    return this.x3dh.decodePublicBundle(bundle);
+    const { bundle, opk } = await res.json();
+    const decoded = this.x3dh.decodePublicBundle(bundle);
+    decoded.opk = opk || null;
+    return decoded;
   }
 
   // ── Session management ────────────────────────────────────────────────────
@@ -166,14 +173,26 @@ class SignalProtocol {
 
     const peerBundle = await this._fetchPeerBundle(peerUsid);
 
-    // X3DH — initiator path
-    const { ephemeralPublicBytes, sharedSecret } = await this.x3dh.createInitialMessage(
+    let theirOpkBytes = null;
+    let opkId = null;
+    if (peerBundle.opk && peerBundle.opk.publicKey) {
+      try {
+        theirOpkBytes = this.crypto.base64ToBuffer(peerBundle.opk.publicKey);
+        opkId = peerBundle.opk.id;
+      } catch (opkErr) {
+        console.warn('[Signal] Could not parse peer OPK, falling back to 3-DH:', opkErr);
+      }
+    }
+
+    // X3DH — initiator path (4-DH if OPK present, else 3-DH fallback)
+    const { ephemeralPublicBytes, sharedSecret, usedOpk } = await this.x3dh.createInitialMessage(
       this.identity.identityPrivateKey,
       this.identity.identityPublicBytes,
       peerBundle.identityPublicBytes,
       peerBundle.signedPreKeyPublicBytes,
       peerBundle.signedPreKeySignature,
       peerBundle.signingPublicBytes,
+      theirOpkBytes,
     );
 
     // Initialize Double Ratchet (initiator)
@@ -183,7 +202,7 @@ class SignalProtocol {
     this._sessionMeta.set(peerUsid, { peerIdentityPublicBytes: peerBundle.identityPublicBytes });
     await this.idb.saveSession(peerUsid, dr.getState());
 
-    console.log(`[Signal] Session opened with ${peerUsid.substring(0,12)}…`);
+    console.log(`[Signal] Session opened with ${peerUsid.substring(0,12)}… (${usedOpk ? '4-DH' : '3-DH fallback'})`);
 
     // Return the X3DH initial message payload (sent over WS so peer can respond)
     return {
@@ -193,6 +212,8 @@ class SignalProtocol {
       senderSpkPublic:        this.crypto.bufferToBase64(this.identity.signedPreKeyPublicBytes),
       senderSpkSignature:     this.crypto.bufferToBase64(this.identity.signedPreKeySignature),
       ephemeralPublic:        this.crypto.bufferToBase64(ephemeralPublicBytes),
+      ratchetPublic:          this.crypto.bufferToBase64(dr.dhPublicKeyBytes),
+      opkId:                  usedOpk ? opkId : null,
     };
   }
 
@@ -216,19 +237,39 @@ class SignalProtocol {
     const valid = await this.crypto.verifyEd25519(theirSpkPublicBytes, theirSpkSignature, theirSigningPublic);
     if (!valid) throw new Error('[Signal] Peer SPK signature invalid — rejecting session');
 
-    // X3DH — responder path
+    // Look up one-time prekey if initiator used DH4
+    let myOpkPrivate = null;
+    const opkState = (await this.idb.loadOpkState()) || { count: 0, keys: [], lastKeyId: 0 };
+    if (msg.opkId !== undefined && msg.opkId !== null && Array.isArray(opkState.keys)) {
+      const idx = opkState.keys.findIndex((k) => k.id === msg.opkId);
+      if (idx !== -1) {
+        myOpkPrivate = opkState.keys[idx].privateKey;
+        opkState.keys.splice(idx, 1);
+        opkState.count = opkState.keys.length;
+        await this.idb.saveOpkState(opkState);
+        this.replenishPreKeysIfNecessary();
+      }
+    }
+
+    // X3DH — responder path (4-DH if OPK was matched, else 3-DH fallback)
     const { sharedSecret } = await this.x3dh.processInitialMessage(
       theirIdentityPublicBytes,
       theirEphemeralPublicBytes,
       this.identity.identityPrivateKey,
       this.identity.signedPreKeyPrivate,
+      myOpkPrivate,
     );
+
+    // Use initiator's ratchet public key if provided, else fall back to identity public
+    const theirRatchetPublicBytes = msg.ratchetPublic
+      ? this.crypto.base64ToBuffer(msg.ratchetPublic)
+      : theirIdentityPublicBytes;
 
     // Initialize Double Ratchet (responder)
     const dr = new DoubleRatchet(this.crypto);
     await dr.initialize(
       sharedSecret,
-      theirIdentityPublicBytes,
+      theirRatchetPublicBytes,
       false,
       {
         privateKey: this.identity.signedPreKeyPrivate,
@@ -239,16 +280,7 @@ class SignalProtocol {
     this._sessionMeta.set(peerUsid, { peerIdentityPublicBytes: theirIdentityPublicBytes });
     await this.idb.saveSession(peerUsid, dr.getState());
 
-    // Deduct one OPK to simulate usage and trigger replenishment if needed
-    const opkState = await this.idb.loadOpkState() || { count: 0, keys: [], lastKeyId: 0 };
-    if (opkState.count > 0) {
-       opkState.keys.shift();
-       opkState.count = opkState.keys.length;
-       await this.idb.saveOpkState(opkState);
-       this.replenishPreKeysIfNecessary();
-    }
-
-    console.log(`[Signal] Accepted session from ${peerUsid.substring(0,12)}…`);
+    console.log(`[Signal] Accepted session from ${peerUsid.substring(0,12)}… (${myOpkPrivate ? '4-DH' : '3-DH fallback'})`);
   }
 
   // ── Encrypt / Decrypt ─────────────────────────────────────────────────────
@@ -379,6 +411,7 @@ class SignalProtocol {
 
   async closeSession(peerUsid) {
     this.sessions.delete(peerUsid);
+    this._sessionMeta.delete(peerUsid);
     await this.idb.deleteSession(peerUsid);
   }
 

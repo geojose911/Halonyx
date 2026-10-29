@@ -14,14 +14,37 @@ const server = http.createServer(app);
 app.use(express.json());
 app.set('trust proxy', 1);
 
+<<<<<<< HEAD
 // ── Serve Frontend ──
 app.use(express.static(path.join(__dirname, "../frontend")));
+=======
+// Security Headers & Content Security Policy (T-11)
+app.use((req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; " +
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+    "font-src 'self' https://fonts.gstatic.com; " +
+    "img-src 'self' data: blob:; " +
+    "media-src 'self' blob: data:; " +
+    "connect-src 'self' ws: wss: https://cdn.jsdelivr.net wss://tracker.openwebtorrent.com wss://tracker.webtorrent.dev wss://tracker.files.fm:7073 wss://tracker.btorrent.xyz; " +
+    "object-src 'none'; " +
+    "base-uri 'self'; " +
+    "form-action 'self';"
+  );
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  next();
+});
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
 
 // Operational Database
-const db = new sqlite3.Database("./backend/db/app.db");
+const db = new sqlite3.Database(path.join(__dirname, "db", "app.db"));
 // Identity Database (Metadata)
-const idDb = new sqlite3.Database("./backend/db/identity.db");
-const keyDb = new sqlite3.Database("./backend/db/keys.db");
+const idDb = new sqlite3.Database(path.join(__dirname, "db", "identity.db"));
+const keyDb = new sqlite3.Database(path.join(__dirname, "db", "keys.db"));
 
 // Initialize Databases
 function initDb(database, schemaPath) {
@@ -34,12 +57,12 @@ function initDb(database, schemaPath) {
   });
 }
 
-initDb(db, "./backend/db/schema.sql");
-initDb(idDb, "./backend/db/identity_schema.sql");
-initDb(keyDb, "./backend/db/key_schema.sql");
+initDb(db, path.join(__dirname, "db", "schema.sql"));
+initDb(idDb, path.join(__dirname, "db", "identity_schema.sql"));
+initDb(keyDb, path.join(__dirname, "db", "key_schema.sql"));
 
 const crypto = require("crypto");
-const JWT_SECRET_FILE = "./backend/db/.jwt_secret";
+const JWT_SECRET_FILE = path.join(__dirname, "db", ".jwt_secret");
 
 function getJwtSecret() {
   if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
@@ -49,7 +72,7 @@ function getJwtSecret() {
       if (stored && stored.length >= 16) return stored;
     }
     const secret = crypto.randomBytes(32).toString("hex");
-    const dbDir = "./backend/db";
+    const dbDir = path.join(__dirname, "db");
     if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
     fs.writeFileSync(JWT_SECRET_FILE, secret, "utf8");
     return secret;
@@ -269,6 +292,43 @@ app.post("/add-contact", authenticate, (req, res) => {
         }
       );
     }
+<<<<<<< HEAD
+=======
+  });
+});
+
+// GET /keys/:hashedUsid — fetch a peer's public key bundle (and dispense one OPK if available)
+app.get("/keys/:hashedUsid", (req, res) => {
+  const rawParam = req.params.hashedUsid || "";
+  const clean = rawParam.trim().toLowerCase().replace(/^0x/, "");
+  const candidates = [...new Set([clean, hashUSID(clean)])];
+
+  keyDb.get(
+    "SELECT bundle, hashed_usid FROM key_bundles WHERE hashed_usid IN (?, ?)",
+    candidates,
+    (err, row) => {
+      if (err || !row)
+        return res.status(404).json({ error: "Key bundle not found" });
+      try {
+        const bundle = JSON.parse(row.bundle);
+        let opk = null;
+        if (Array.isArray(bundle.preKeys) && bundle.preKeys.length > 0) {
+          opk = bundle.preKeys.shift();
+          const now = Date.now();
+          keyDb.run(
+            "UPDATE key_bundles SET bundle = ?, updated_at = ? WHERE hashed_usid = ?",
+            [JSON.stringify(bundle), now, row.hashed_usid],
+            (updateErr) => {
+              if (updateErr) console.error("[Keys] Failed to consume OPK:", updateErr);
+            }
+          );
+        }
+        res.json({ bundle, opk });
+      } catch (e) {
+        res.status(500).json({ error: "Failed to parse key bundle" });
+      }
+    },
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
   );
 });
 
@@ -279,10 +339,79 @@ const clients = new Map(); // hashed_usid -> WebSocket
 wss.on("connection", (ws, req) => {
   console.log("[WS] New connection");
 
+<<<<<<< HEAD
   ws.on("message", (data) => {
+=======
+// Helper: Normalize identifier to 64-character canonical SHA-256 hashed USID
+function resolveCanonicalUsid(targetUsid) {
+  if (!targetUsid || typeof targetUsid !== "string") return "";
+  const clean = targetUsid.trim().toLowerCase().replace(/^0x/, "");
+  if (clean.length === 64) return clean;
+  return hashUSID(clean);
+}
+
+// Helper: Resilient lookup of active WebSocket connection by direct, normalized, or hashed USID
+function resolveRecipientWs(targetUsid) {
+  if (!targetUsid || typeof targetUsid !== "string") return null;
+  const clean = targetUsid.trim().toLowerCase().replace(/^0x/, "");
+  if (!clean) return null;
+
+  // 1. Direct clean lookup
+  let targetWs = clients.get(clean);
+  if (targetWs && targetWs.readyState === WebSocket.OPEN) return targetWs;
+
+  // 2. Hash lookup (in case sender routed via unhashed raw USID)
+  const hashed = hashUSID(clean);
+  targetWs = clients.get(hashed);
+  if (targetWs && targetWs.readyState === WebSocket.OPEN) return targetWs;
+
+  // 3. Scan active clients for case-insensitive / prefixed match
+  for (const [key, clientSocket] of clients.entries()) {
+    if (clientSocket && clientSocket.readyState === WebSocket.OPEN) {
+      const cleanKey = key.trim().toLowerCase().replace(/^0x/, "");
+      if (cleanKey === clean || cleanKey === hashed) {
+        return clientSocket;
+      }
+    }
+  }
+
+  return null;
+}
+
+// Keep-Alive Heartbeat: send periodic WebSocket protocol ping to prevent cloud reverse proxy idle drop
+const PING_INTERVAL_MS = 25000;
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log("[WS] Terminating inactive socket (heartbeat timeout)");
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch (_) {
+      ws.terminate();
+    }
+  });
+}, PING_INTERVAL_MS);
+
+if (pingInterval.unref) pingInterval.unref();
+
+wss.on("connection", (ws) => {
+  let userHashedUsid = null;
+  ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
+
+  console.log("[WS] New raw connection established");
+
+  ws.on("message", (message) => {
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
     try {
       const msg = JSON.parse(data);
 
+<<<<<<< HEAD
       if (msg.type === "register" && msg.usid) {
         const userHashedUsid = msg.usid;
         clients.set(userHashedUsid, ws);
@@ -315,17 +444,152 @@ wss.on("connection", (ws, req) => {
         const userHashedUsid = ws.userHashedUsid || null;
         const to = msg.to;
         const encrypted = msg.payload || null;
+=======
+      // Application-level keepalive heartbeat
+      if (data.type === "ping") {
+        ws.isAlive = true;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
+        }
+        return;
+      }
+      if (data.type === "pong") {
+        ws.isAlive = true;
+        return;
+      }
+
+      if (data.type === "register") {
+        const { token } = data;
+        if (!token) {
+          console.log("[WS] Registration REJECTED: Missing authentication token");
+          ws.send(JSON.stringify({ type: "error", message: "Authentication token required" }));
+          return;
+        }
+
+        jwt.verify(token, JWT_SECRET, (jwtErr, decoded) => {
+          if (jwtErr || !decoded || !decoded.hashedUsid) {
+            console.log("[WS] Registration REJECTED: Invalid or expired JWT token");
+            ws.send(JSON.stringify({ type: "error", message: "Authentication failed: invalid token" }));
+            return;
+          }
+
+          const tokenHashedUsid = decoded.hashedUsid;
+
+          // Helper that completes registration once JWT is verified
+          function finaliseRegistration(row, canonicalHashedUsid) {
+            userHashedUsid = canonicalHashedUsid;
+
+            // Gracefully supersede any existing connection for this identity to prevent split-brain
+            const prevWs = clients.get(userHashedUsid);
+            if (prevWs && prevWs !== ws && prevWs.readyState === WebSocket.OPEN) {
+              try { prevWs.close(1000, "Superseded by new session"); } catch (_) {}
+            }
+
+            clients.set(userHashedUsid, ws);
+            console.log(`[WS] User Registered: ${row.name} (${userHashedUsid.substring(0, 8)}...)`);
+
+            const registeredMsg = { type: "registered", success: true };
+            ws.send(JSON.stringify(registeredMsg));
+
+            // ── Offline Mailbox Flush (T-14: with TTL expiry) ──────────
+            const MAILBOX_TTL_DAYS = 7;
+            db.all(
+              "SELECT * FROM mailbox WHERE recipient_hashed_usid = ? AND timestamp >= datetime('now', '-7 days') ORDER BY timestamp ASC",
+              [canonicalHashedUsid],
+              (mbErr, pending) => {
+                if (mbErr || !pending || pending.length === 0) return;
+                console.log(`[Mailbox] Flushing ${pending.length} queued message(s) to ${canonicalHashedUsid.substring(0, 8)}...`);
+                pending.forEach((m) => {
+                  let parsed = null;
+                  try { parsed = JSON.parse(m.content); } catch (e) { }
+                  if (parsed && parsed.type === "x3dh_init") {
+                    ws.send(JSON.stringify({
+                      ...parsed,
+                      from: m.sender_hashed_usid,
+                    }));
+                  } else {
+                    ws.send(JSON.stringify({
+                      type: "message",
+                      from: m.sender_hashed_usid,
+                      encrypted: parsed !== null ? parsed : m.content,
+                      timestamp: m.timestamp,
+                    }));
+                  }
+                });
+                db.run(
+                  "DELETE FROM mailbox WHERE recipient_hashed_usid = ?",
+                  [canonicalHashedUsid],
+                  (delErr) => {
+                    if (delErr) console.error("[Mailbox] Failed to purge mailbox:", delErr);
+                    else console.log(`[Mailbox] Purged ${pending.length} message(s) for ${canonicalHashedUsid.substring(0, 8)}...`);
+                  }
+                );
+              }
+            );
+
+            // Clean expired mailbox messages beyond TTL
+            db.run("DELETE FROM mailbox WHERE timestamp < datetime('now', '-7 days')");
+            // ──────────────────────────────────────────────────────────
+          }
+
+          idDb.get(
+            "SELECT name, hashed_usid FROM users_metadata WHERE hashed_usid = ?",
+            [tokenHashedUsid],
+            (dbErr, row) => {
+              if (!dbErr && row) {
+                return finaliseRegistration(row, row.hashed_usid);
+              }
+
+              console.log(`[WS] Registration REJECTED: ${tokenHashedUsid.substring(0, 8)}... (Not in Identity DB)`);
+              ws.send(JSON.stringify({ type: "error", message: "Identity not verified" }));
+            }
+          );
+        });
+        return;
+      }
+
+      if (data.type === "message") {
+        const { to, content, encrypted } = data;
+        if (!userHashedUsid || !to) return;
+
+        // Plaintext content is strictly rejected on the relay (T-08 / E2EE enforcement)
+        if (content !== undefined && content !== null) {
+          ws.send(JSON.stringify({ type: "error", message: "Plaintext content is not permitted" }));
+          return;
+        }
+
+        if (!encrypted) {
+          ws.send(JSON.stringify({ type: "error", message: "Only encrypted messages are permitted" }));
+          return;
+        }
+
+        const canonicalTo = resolveCanonicalUsid(to);
+        if (canonicalTo === userHashedUsid) return; // Prevent self-loopback
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
 
         console.log(
           `[WS] Message: ${userHashedUsid ? userHashedUsid.substring(0, 8) : "?"}... → ${to ? to.substring(0, 8) : "?"}...`
         );
 
-        const recipientWs = clients.get(to);
+        const recipientWs = clients.get(to) && clients.get(to).readyState === WebSocket.OPEN
+          ? clients.get(to)
+          : resolveRecipientWs(to);
+
         if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
           recipientWs.send(
+<<<<<<< HEAD
             JSON.stringify({ type: "message", from: userHashedUsid, payload: encrypted || msg.content })
+=======
+            JSON.stringify({
+              type: "message",
+              from: userHashedUsid,
+              encrypted: encrypted,
+              timestamp: new Date().toISOString(),
+            }),
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
           );
         } else {
+<<<<<<< HEAD
           // Recipient is offline — queue in mailbox (encrypted blobs only)
           if (!encrypted) {
             console.log("[WS] Only encrypted messages are queued for offline delivery");
@@ -343,10 +607,58 @@ wss.on("connection", (ws, req) => {
                   ws.send(JSON.stringify({ type: "queued" }));
                 }
               }
+=======
+          // Offline mailbox — enforce per-recipient cap and TTL (T-14)
+          const MAILBOX_CAP = parseInt(process.env.MAILBOX_CAP || "200", 10);
+
+          // Clean expired messages
+          db.run("DELETE FROM mailbox WHERE timestamp < datetime('now', '-7 days')");
+
+          // Check recipient mailbox capacity
+          db.get(
+            "SELECT COUNT(*) AS count FROM mailbox WHERE recipient_hashed_usid = ?",
+            [canonicalTo],
+            (countErr, countRow) => {
+              if (countErr) {
+                ws.send(JSON.stringify({ type: "error", message: "Mailbox store check failed" }));
+                return;
+              }
+
+              if (countRow && countRow.count >= MAILBOX_CAP) {
+                console.log(`[Mailbox] Cap exceeded for recipient ${canonicalTo.substring(0, 8)} (${countRow.count}/${MAILBOX_CAP})`);
+                ws.send(JSON.stringify({ type: "error", message: "Recipient mailbox is full (cap reached)" }));
+                return;
+              }
+
+              const storeContent = typeof encrypted === 'string' ? encrypted : JSON.stringify(encrypted);
+              db.run(
+                "INSERT INTO mailbox (recipient_hashed_usid, sender_hashed_usid, content) VALUES (?, ?, ?)",
+                [canonicalTo, userHashedUsid, storeContent],
+                (mbErr) => {
+                  if (mbErr) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "error",
+                        message: "Mailbox store failed",
+                      }),
+                    );
+                  } else {
+                    ws.send(
+                      JSON.stringify({
+                        type: "queued",
+                        recipient: to,
+                        message: "Recipient offline — message queued",
+                      }),
+                    );
+                  }
+                },
+              );
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
             }
           );
         }
 
+<<<<<<< HEAD
       } else if (msg.type === "broadcast") {
         clients.forEach((client) => {
           if (client.readyState === WebSocket.OPEN) {
@@ -354,6 +666,65 @@ wss.on("connection", (ws, req) => {
               JSON.stringify({ type: "broadcast", from: ws.userHashedUsid, payload: msg.payload })
             );
           }
+=======
+      // X3DH handshake relay — forward to recipient so they can set up E2EE
+      if (data.type === "x3dh_init") {
+        const { to } = data;
+        if (!userHashedUsid || !to) return;
+        const recipientWs = clients.get(to) && clients.get(to).readyState === WebSocket.OPEN
+          ? clients.get(to)
+          : resolveRecipientWs(to);
+        if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          recipientWs.send(JSON.stringify({ ...data, from: userHashedUsid }));
+          console.log(
+            `[WS] X3DH init relayed: ${userHashedUsid.substring(0, 8)} → ${to.substring(0, 8)}`,
+          );
+        } else {
+          // Recipient offline — queue x3dh_init in mailbox so peer can establish session upon reconnecting
+          const canonicalTo = resolveCanonicalUsid(to);
+          const storeContent = JSON.stringify({ ...data, from: userHashedUsid });
+          db.run(
+            "INSERT INTO mailbox (recipient_hashed_usid, sender_hashed_usid, content) VALUES (?, ?, ?)",
+            [canonicalTo, userHashedUsid, storeContent],
+            (mbErr) => {
+              if (mbErr) console.error("[Mailbox] Failed to queue x3dh_init:", mbErr);
+              else console.log(`[Mailbox] Queued x3dh_init for offline recipient ${canonicalTo.substring(0, 8)}`);
+            }
+          );
+        }
+      }
+
+      if (data.type === "emergency_broadcast") {
+        if (!userHashedUsid) {
+          ws.send(JSON.stringify({ type: "error", message: "Not registered — cannot send emergency" }));
+          return;
+        }
+
+        // --- WS→UDP rate limit: 1 emergency per 60s per user ---
+        if (!wsEmergencyLimiter.allow(userHashedUsid)) {
+          console.warn(`[WS->UDP] RATE-LIMITED emergency from ${userHashedUsid.substring(0, 8)}`);
+          ws.send(JSON.stringify({ type: "error", message: "Emergency cooldown active — please wait before sending another" }));
+          return;
+        }
+
+        // Sanitize content
+        const emergencyContent = data.content && typeof data.content === "string"
+          ? data.content.substring(0, UDP_MAX_CONTENT_LEN)
+          : "EMERGENCY: Immediate assistance required!";
+
+        console.log(
+          `[WS->UDP] Emergency from ${userHashedUsid.substring(0, 8)}`,
+        );
+        const udpMessage = Buffer.from(
+          JSON.stringify({
+            content: emergencyContent,
+            from: userHashedUsid,
+            token: "INTERNAL_UDP_SECRET"
+          }),
+        );
+        udpServer.send(udpMessage, UDP_PORT, "localhost", (err) => {
+          if (err) console.error("[UDP] Bridge Error:", err);
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
         });
       }
     } catch (e) {
@@ -362,9 +733,23 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
+<<<<<<< HEAD
     if (ws.userHashedUsid) {
       clients.delete(ws.userHashedUsid);
       console.log(`[WS] Disconnected: ${ws.userHashedUsid.substring(0, 8)}...`);
+=======
+    if (userHashedUsid) {
+      if (clients.get(userHashedUsid) === ws) {
+        clients.delete(userHashedUsid);
+        console.log(
+          `[WS] User Disconnected: ${userHashedUsid.substring(0, 8)}...`,
+        );
+      } else {
+        console.log(
+          `[WS] Stale socket closed for: ${userHashedUsid.substring(0, 8)}... (active socket retained)`,
+        );
+      }
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
     }
   });
 });
@@ -379,3 +764,37 @@ server.listen(PORT, () => {
   console.log(`[Halonyx] Server running on http://localhost:${PORT}`);
   console.log(`[Halonyx] Frontend served from ./frontend/`);
 });
+<<<<<<< HEAD
+=======
+
+udpServer.bind(UDP_PORT, "127.0.0.1");
+
+// Disable all caching — must come BEFORE static middleware so browsers
+// never serve stale JS/protocol files from cache.
+app.use((req, res, next) => {
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, proxy-revalidate",
+  );
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Surrogate-Control", "no-store");
+  next();
+});
+
+// Serve protocol/ files at /protocol/*
+app.use(
+  "/protocol",
+  express.static(path.join(__dirname, "..", "protocol"), { etag: false, lastModified: false }),
+);
+
+// Serve assets/ files at /assets/*
+app.use(
+  "/assets",
+  express.static(path.join(__dirname, "..", "assets"), { etag: false, lastModified: false }),
+);
+
+app.use(express.static(path.join(__dirname, "..", "frontend"), { etag: false, lastModified: false }));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+>>>>>>> f360971d66e428dedbb99f038f3b53890c11e7be
